@@ -89,10 +89,15 @@ class TestPythonFilesystem:
             _strip_protocol = classmethod(fsspec.AbstractFileSystem._strip_protocol.__func__)
 
         memory = ExtendedMemoryFileSystem(skip_instance_cache=True)
-        add_file(memory)
+        # DuckDB only accepts absolute paths in file:// URLs, so the file has to live at one
+        with (
+            (Path(__file__).parent / "data" / FILENAME).open("rb") as source,
+            memory.open(f"/{FILENAME}", "wb") as dest,
+        ):
+            copyfileobj(source, dest)
         duckdb_cursor.register_filesystem(memory)
         for protocol in memory.protocol:
-            duckdb_cursor.execute(f"select * from '{protocol}://{FILENAME}'")
+            duckdb_cursor.execute(f"select * from '{protocol}:///{FILENAME}'")
 
             assert duckdb_cursor.fetchall() == [(1, 10, 0), (2, 50, 30)]
 
@@ -281,7 +286,7 @@ class TestPythonFilesystem:
         c = duckdb.connect()
         c.register_filesystem(fsspec.implementations.local.LocalFileSystem())
 
-        q = f"SELECT * FROM read_parquet('file://{tmp_path}/table*.parquet', union_by_name = TRUE) ORDER BY time DESC LIMIT 1"  # noqa: E501
+        q = f"SELECT * FROM read_parquet('file:///{tmp_path.as_posix()}/table*.parquet', union_by_name = TRUE) ORDER BY time DESC LIMIT 1"  # noqa: E501
 
         res = c.sql(q).fetchall()
         assert res == [(1719568210134107692, 1)]
