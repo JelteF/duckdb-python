@@ -447,7 +447,7 @@ std::unique_ptr<DuckDBPyExpression> DuckDBPyExpression::SQLExpression(string sql
 	auto &context = *conn->con.GetConnection().context;
 	vector<unique_ptr<ParsedExpression>> expressions;
 	try {
-		expressions = Parser::ParseExpressionList(sql, context.GetParserOptions());
+		expressions = Parser(context).ParseExpressionList(sql);
 	} catch (std::runtime_error &e) {
 		throw;
 	}

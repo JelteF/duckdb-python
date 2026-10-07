@@ -232,7 +232,7 @@ vector<unique_ptr<ParsedExpression>> GetExpressions(ClientContext &context, cons
 		return expressions;
 	} else if (nb::isinstance<nb::str>(expr)) {
 		auto aggregate_list = nb::cast<std::string>(nb::str(expr));
-		return Parser::ParseExpressionList(aggregate_list, context.GetParserOptions());
+		return Parser(context).ParseExpressionList(aggregate_list);
 	} else {
 		// A single Expression could be supported here by wrapping it in a vector
 		string actual_type = nb::cast<std::string>(nb::str((expr).type()));
@@ -389,6 +389,7 @@ string DuckDBPyRelation::GenerateExpressionList(const string &function_name, vec
 		return expr +=
 		       function_name + "(" + function_parameter + ((ignore_nulls) ? " ignore nulls) " : ") ") + window_spec;
 	}
+	Parser parser(*rel->context->GetContext());
 	for (idx_t i = 0; i < input.size(); i++) {
 		// We parse the input as an expression to validate it.
 		auto trimmed_input = input[i];
@@ -399,14 +400,14 @@ string DuckDBPyRelation::GenerateExpressionList(const string &function_name, vec
 
 		unique_ptr<ParsedExpression> expression;
 		try {
-			auto expressions = Parser::ParseExpressionList(trimmed_input);
+			auto expressions = parser.ParseExpressionList(trimmed_input);
 			if (expressions.size() == 1) {
 				expression = std::move(expressions[0]);
 			}
 		} catch (const ParserException &) {
 			// First attempt at parsing failed, the input might be a column name that needs quoting.
 			auto quoted_input = SQLQuotedIdentifier::ToString(trimmed_input);
-			auto expressions = Parser::ParseExpressionList(quoted_input);
+			auto expressions = parser.ParseExpressionList(quoted_input);
 			if (expressions.size() == 1 && expressions[0]->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 				expression = std::move(expressions[0]);
 			}
@@ -1535,7 +1536,7 @@ std::unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Query(const string &view_nam
 	rel->CreateView(Identifier(view_name), /*replace=*/true, /*temporary=*/true);
 	auto all_dependencies = rel->GetAllDependencies();
 
-	Parser parser(rel->context->GetContext()->GetParserOptions());
+	Parser parser(*rel->context->GetContext());
 	parser.ParseQuery(sql_query);
 	if (parser.statements.size() != 1) {
 		throw InvalidInputException("'DuckDBPyRelation.query' only accepts a single statement");
