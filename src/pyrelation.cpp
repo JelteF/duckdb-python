@@ -18,7 +18,8 @@
 #include "duckdb/main/relation/table_function_relation.hpp"
 #include "duckdb_python/map.hpp"
 #include "duckdb_python/expression/pyexpression.hpp"
-#include "duckdb/common/arrow/physical_arrow_collector.hpp"
+#include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/arrow/arrow_format.hpp"
 #include "duckdb_python/arrow/arrow_export_utils.hpp"
 
 namespace duckdb {
@@ -810,9 +811,10 @@ duckdb::pyarrow::RecordBatchReader DuckDBPyRelation::FetchRecordBatchReader(idx_
 }
 
 //! Submits the relation and returns the undriven handle. Call with the GIL released.
-static unique_ptr<QueryResult> PySubmitRelation(const shared_ptr<Relation> &rel, bool stream_result) {
+static unique_ptr<QueryResult> PySubmitRelation(const shared_ptr<Relation> &rel, bool stream_result,
+                                                shared_ptr<ResultFormat> format = nullptr) {
 	auto context = rel->context->GetContext();
-	QueryParameters parameters;
+	QueryParameters parameters(std::move(format));
 	// A stream can only be opened on a handle whose retention is still undecided at submission
 	parameters.result_eagerness = stream_result ? ResultEagerness::AUTO : ResultEagerness::FORCED;
 	auto result = context->Submit(rel, parameters);
@@ -838,7 +840,7 @@ unique_ptr<QueryResult> DuckDBPyRelation::ExecuteInternal() {
 	return PyExecuteRelation(rel);
 }
 
-void DuckDBPyRelation::ExecuteOrThrow(bool stream_result) {
+void DuckDBPyRelation::ExecuteOrThrow(bool stream_result, shared_ptr<ResultFormat> format) {
 	nb::gil_scoped_acquire gil;
 	result.reset();
 	if (!rel) {
@@ -848,7 +850,7 @@ void DuckDBPyRelation::ExecuteOrThrow(bool stream_result) {
 	std::shared_ptr<DuckDBPyResult> py_result;
 	{
 		nb::gil_scoped_release release;
-		auto submitted = PySubmitRelation(rel, stream_result);
+		auto submitted = PySubmitRelation(rel, stream_result, std::move(format));
 		py_result = std::make_shared<DuckDBPyResult>(std::move(submitted), stream_result);
 	}
 	result = std::move(py_result);
@@ -964,16 +966,7 @@ pyarrow::Table DuckDBPyRelation::ToArrowTableInternal(idx_t batch_size, bool to_
 		return nb::none();
 	}
 	if (!result) {
-		auto &config = ClientConfig::GetConfig(*rel->context->GetContext());
-		ScopedConfigSetting scoped_setting(
-		    config,
-		    [&batch_size](ClientConfig &config) {
-			    config.get_result_collector = [&batch_size](ClientContext &context, PreparedStatementData &data) {
-				    return PhysicalArrowCollector::Create(context, data, batch_size);
-			    };
-		    },
-		    [](ClientConfig &config) { config.get_result_collector = nullptr; });
-		ExecuteOrThrow();
+		ExecuteOrThrow(false, make_shared_ptr<ArrowFormat>(batch_size));
 	}
 	AssertResultOpen();
 	auto res = result->FetchArrowTable(batch_size, to_polars);

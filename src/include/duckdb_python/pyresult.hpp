@@ -90,8 +90,8 @@ private:
 	void CloseStream();
 	std::unique_ptr<NumpyResultConversion> InitializeNumpyConversion(bool pandas = false);
 
-	//! Re-feed a retained result's collection through a PhysicalArrowCollector on the user's own
-	//! context, which converts in parallel and yields an ArrowQueryResult in its place.
+	//! Re-feed a retained result's collection through a query in the ArrowFormat on the user's own
+	//! context, which converts in parallel and yields an Arrow result in its place.
 	void PromoteMaterializedToArrow(idx_t batch_size);
 
 	template <typename T>

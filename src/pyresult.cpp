@@ -6,15 +6,14 @@
 
 #include "duckdb_python/arrow/arrow_array_stream.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
+#include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/arrow/arrow_format.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
-#include "duckdb/common/arrow/result_arrow_wrapper.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb_python/arrow/arrow_export_utils.hpp"
-#include "duckdb/common/arrow/arrow_query_result.hpp"
-#include "duckdb/common/arrow/physical_arrow_collector.hpp"
-#include "duckdb/main/client_config.hpp"
+#include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
@@ -341,7 +340,7 @@ std::unique_ptr<NumpyResultConversion> DuckDBPyResult::InitializeNumpyConversion
 	}
 
 	idx_t initial_capacity = STANDARD_VECTOR_SIZE * 2ULL;
-	if (result && result->GetResultType() == QueryResultType::MATERIALIZED_RESULT) {
+	if (result && result->Format().Is<ChunkFormat>()) {
 		initial_capacity = result->RowCount();
 	}
 
@@ -551,7 +550,7 @@ static unique_ptr<SelectStatement> MakeColumnDataScanStatement(unique_ptr<Column
 }
 
 void DuckDBPyResult::PromoteMaterializedToArrow(idx_t batch_size) {
-	D_ASSERT(result->GetResultType() == QueryResultType::MATERIALIZED_RESULT);
+	D_ASSERT(result->Format().Is<ChunkFormat>());
 	auto client_context = result->client_properties.client_context;
 	if (!client_context) {
 		throw InternalException("Cannot promote result to Arrow: the originating client context is gone");
@@ -560,21 +559,11 @@ void DuckDBPyResult::PromoteMaterializedToArrow(idx_t batch_size) {
 	auto names = ResultNames();
 	auto select = MakeColumnDataScanStatement(result->TakeCollection(), names);
 
-	auto &config = ClientConfig::GetConfig(*context);
-	ScopedConfigSetting scoped_setting(
-	    config,
-	    [batch_size](ClientConfig &config) {
-		    config.get_result_collector = [batch_size](ClientContext &context, PreparedStatementData &data) {
-			    return PhysicalArrowCollector::Create(context, data, batch_size);
-		    };
-	    },
-	    [](ClientConfig &config) { config.get_result_collector = nullptr; });
-
 	unique_ptr<QueryResult> new_result;
 	{
 		D_ASSERT(duckdb::PyUtil::GilCheck());
 		nb::gil_scoped_release release;
-		new_result = context->Submit(std::move(select), QueryParameters());
+		new_result = context->Submit(std::move(select), QueryParameters(make_shared_ptr<ArrowFormat>(batch_size)));
 		DuckDBPyConnection::CompleteQuery(*new_result);
 	}
 	names_override = std::move(names); // restore names de-duplicated by re-binding
@@ -607,19 +596,19 @@ duckdb::pyarrow::Table DuckDBPyResult::MaterializedResultToArrowTable(const Arro
                                                                       const idx_t rows_per_batch) {
 	Retain();
 	D_ASSERT(result);
-	D_ASSERT(result->GetResultType() == QueryResultType::MATERIALIZED_RESULT ||
-	         result->GetResultType() == QueryResultType::ARROW_RESULT);
+	D_ASSERT(result->Format().Is<ChunkFormat>() || result->Format().Is<ArrowFormat>());
 
 	auto pyarrow_schema = pyarrow::ToPyArrowSchema(arrow_schema);
-	if (result->GetResultType() == QueryResultType::MATERIALIZED_RESULT) {
+	if (result->Format().Is<ChunkFormat>()) {
 		PromoteMaterializedToArrow(rows_per_batch);
 	}
 	nb::list batches;
-	auto &arrow_result = result->Cast<ArrowQueryResult>();
-	auto arrays = arrow_result.ConsumeArrays();
-	for (auto &array : arrays) {
-		ArrowArray data = array->arrow_array;
-		array->arrow_array.release = nullptr;
+	auto arrays = result->TakeCollection<ArrowFormat>();
+	for (auto &array : *arrays) {
+		// The collection's arrays are shared and immutable, so pyarrow gets an export that keeps its
+		// array alive instead of the array itself
+		ArrowArray data;
+		ArrowFormat::ShareArray(array)->MoveTo(data);
 		TransformDuckToArrowChunk(pyarrow_schema, data, batches);
 	}
 	return pyarrow::ToArrowTable(std::move(batches), pyarrow_schema);
@@ -698,6 +687,160 @@ void ForwardRelease(ArrowArrayStream *stream) {
 	stream->release = nullptr;
 }
 
+//! Converts a chunk result into Arrow batches on the consumer thread. A query's format is fixed when it
+//! is submitted, and these were submitted before anyone asked for Arrow, so the engine's ArrowFormat
+//! cannot build the batches. ArrowFormat's state is not reused for the conversion either, because it
+//! requires a live client context, which a retained result may not have anymore.
+class ChunkResultArrowStream {
+public:
+	ChunkResultArrowStream(unique_ptr<QueryResult> handle, bool drain, idx_t batch_size_p)
+	    : client_properties(handle->client_properties), batch_size(batch_size_p) {
+		if (drain) {
+			chunk_stream = make_uniq<QueryResultStream<ChunkFormat>>(std::move(handle));
+		} else {
+			result = std::move(handle);
+		}
+		names = IdentifiersToStrings(chunk_stream ? chunk_stream->GetNames() : result->GetNames());
+		if (client_properties.client_context) {
+			extension_types = ArrowTypeExtensionData::GetExtensionTypes(*client_properties.client_context, Types());
+		}
+		stream.private_data = this;
+		stream.get_schema = GetSchema;
+		stream.get_next = GetNext;
+		stream.get_last_error = GetLastError;
+		stream.release = Release;
+	}
+
+	ArrowArrayStream stream;
+
+private:
+	const vector<LogicalType> &Types() const {
+		return chunk_stream ? chunk_stream->GetTypes() : result->GetTypes();
+	}
+
+	//! False on an error, which is recorded in last_error. A null chunk means the result is exhausted
+	bool NextChunk() {
+		current_offset = 0;
+		if (!chunk_stream) {
+			current_chunk = result->Fetch();
+			return true;
+		}
+		// A stream ended by another statement has not been asked yet; Poll records that as its error
+		if (chunk_stream->Poll() == QueryResultState::EXECUTION_ERROR) {
+			last_error = chunk_stream->GetErrorObject();
+			return false;
+		}
+		if (!chunk_stream->IsOpen()) {
+			// The ended stream released its context, which converting a batch would need
+			current_chunk.reset();
+			return true;
+		}
+		current_chunk = chunk_stream->Fetch();
+		if (!current_chunk && chunk_stream->HasError()) {
+			last_error = chunk_stream->GetErrorObject();
+			return false;
+		}
+		return true;
+	}
+
+	int FetchBatch(ArrowArray &out) {
+		unique_ptr<ArrowAppender> appender;
+		idx_t count = 0;
+		while (count < batch_size) {
+			if (!current_chunk || current_offset >= current_chunk->size()) {
+				if (exhausted) {
+					break;
+				}
+				if (!NextChunk()) {
+					exhausted = true;
+					return -1;
+				}
+				if (!current_chunk) {
+					exhausted = true;
+					break;
+				}
+				continue;
+			}
+			if (!appender) {
+				appender = make_uniq<ArrowAppender>(Types(), batch_size, client_properties, extension_types);
+			}
+			auto to_append = MinValue(batch_size - count, current_chunk->size() - current_offset);
+			appender->Append(*current_chunk, current_offset, current_offset + to_append, current_chunk->size());
+			current_offset += to_append;
+			count += to_append;
+		}
+		if (count > 0) {
+			out = appender->Finalize();
+		}
+		return 0;
+	}
+
+	static ChunkResultArrowStream &Get(ArrowArrayStream *stream) {
+		return *static_cast<ChunkResultArrowStream *>(stream->private_data);
+	}
+
+	static int GetSchema(ArrowArrayStream *stream, ArrowSchema *out) {
+		if (!stream->release) {
+			return -1;
+		}
+		out->release = nullptr;
+		auto &self = Get(stream);
+		if (self.chunk_stream && self.chunk_stream->HasError()) {
+			self.last_error = self.chunk_stream->GetErrorObject();
+			return -1;
+		}
+		try {
+			ArrowConverter::ToArrowSchema(out, self.Types(), self.names, self.client_properties);
+		} catch (std::exception &ex) {
+			self.last_error = ErrorData(ex);
+			return -1;
+		}
+		return 0;
+	}
+
+	static int GetNext(ArrowArrayStream *stream, ArrowArray *out) {
+		if (!stream->release) {
+			return -1;
+		}
+		out->release = nullptr;
+		auto &self = Get(stream);
+		try {
+			return self.FetchBatch(*out);
+		} catch (std::exception &ex) {
+			self.last_error = ErrorData(ex);
+			return -1;
+		}
+	}
+
+	static const char *GetLastError(ArrowArrayStream *stream) {
+		if (!stream->release) {
+			return "stream was released";
+		}
+		return Get(stream).last_error.Message().c_str();
+	}
+
+	static void Release(ArrowArrayStream *stream) {
+		if (!stream->release) {
+			return;
+		}
+		stream->release = nullptr;
+		delete &Get(stream);
+	}
+
+private:
+	ClientProperties client_properties;
+	idx_t batch_size;
+	//! Exactly one of these is set: the stream when the handle could still be drained, else the retained result
+	unique_ptr<QueryResultStream<ChunkFormat>> chunk_stream;
+	unique_ptr<QueryResult> result;
+	vector<string> names;
+	unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> extension_types;
+	unique_ptr<DataChunk> current_chunk;
+	idx_t current_offset = 0;
+	bool exhausted = false;
+	ErrorData last_error;
+};
+
 //! Releases a stream that was never handed over, for example when the import into pyarrow throws
 struct ArrowArrayStreamGuard {
 	ArrowArrayStream stream;
@@ -716,10 +859,11 @@ ArrowArrayStream DuckDBPyResult::FetchArrowArrayStream(idx_t rows_per_batch) {
 	}
 	auto &client_context = GetClientProperties().client_context;
 	auto context = client_context ? client_context->shared_from_this() : shared_ptr<const ClientContext>();
-	auto handle = submitted ? std::move(submitted) : std::move(result);
+	const bool drain = submitted != nullptr;
+	auto handle = drain ? std::move(submitted) : std::move(result);
 	current_chunk.reset();
 	chunk_offset = 0;
-	const auto result_stream = new ResultArrowArrayStreamWrapper(std::move(handle), rows_per_batch);
+	const auto result_stream = new ChunkResultArrowStream(std::move(handle), drain, rows_per_batch);
 	auto handoff = new EngineStreamHandoff {result_stream->stream, std::move(context)};
 	ArrowArrayStream forwarding;
 	forwarding.get_schema = ForwardGetSchema;
@@ -732,7 +876,7 @@ ArrowArrayStream DuckDBPyResult::FetchArrowArrayStream(idx_t rows_per_batch) {
 
 //! An Arrow result was converted already and has no collection the engine's stream could read
 bool DuckDBPyResult::IsArrow() const {
-	return result && result->GetResultType() == QueryResultType::ARROW_RESULT;
+	return result && result->Format().Is<ArrowFormat>();
 }
 
 duckdb::pyarrow::RecordBatchReader DuckDBPyResult::FetchRecordBatchReader(idx_t rows_per_batch) {

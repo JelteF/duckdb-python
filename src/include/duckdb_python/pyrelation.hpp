@@ -286,7 +286,8 @@ private:
 	void AssertResult() const;
 	void AssertResultOpen() const;
 	void AssertRelation() const;
-	void ExecuteOrThrow(bool stream_result = false);
+	//! A null format leaves the default chunk format
+	void ExecuteOrThrow(bool stream_result = false, shared_ptr<ResultFormat> format = nullptr);
 	//! Runs the relation to a completed, retained result
 	unique_ptr<QueryResult> ExecuteInternal();
 
