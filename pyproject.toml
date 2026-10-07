@@ -189,6 +189,7 @@ include = [
     "external/duckdb/tools/cpp/**",
     "external/duckdb/.github/config/out_of_tree_extensions.cmake",
     "external/duckdb/.github/config/in_tree_extensions.cmake",
+    "external/duckdb/.github/config/extensions/*.cmake",
 ]
 exclude = [
     "/*",
