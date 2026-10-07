@@ -285,6 +285,18 @@ function(duckdb_python_link_extensions target_name)
   endif()
 
   set(loader_extensions "")
+  # Installing and loading external extensions and the builtin HTTP client are
+  # separate archives that, like extensions, only register through their
+  # describe function. DuckDB's local_extension_repository capability is left
+  # out on purpose: it would make autoinstall fetch from this build's own
+  # repository instead of the core one.
+  foreach(capability IN ITEMS loadable_extensions httplib)
+    if(TARGET duckdb_${capability})
+      message(STATUS "Linking DuckDB capability ${capability}")
+      target_link_libraries(${target_name} PRIVATE duckdb_${capability})
+      list(APPEND loader_extensions ${capability})
+    endif()
+  endforeach()
   if(link_extensions)
     message(STATUS "Linking DuckDB extensions:")
     foreach(ext IN LISTS link_extensions)
