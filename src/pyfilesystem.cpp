@@ -155,6 +155,13 @@ vector<OpenFileInfo> PythonFilesystem::Glob(const string &path, FileOpener *open
 	auto unstrip_protocol = filesystem.attr("unstrip_protocol");
 	for (auto item : returner) {
 		string file_path = nb::cast<std::string>(unstrip_protocol(nb::str(item)));
+		// fsspec's LocalFileSystem builds `file://C:/...` on Windows, but DuckDB parses the part after
+		// `file://` up to the next slash as the authority, and only accepts `localhost` there. Adding the
+		// slash gives the proper `file:///C:/...` form, which fsspec strips back to `C:/...` when opening.
+		if (StringUtil::StartsWith(file_path, "file://") && file_path.size() > 8 &&
+		    StringUtil::CharacterIsAlpha(file_path[7]) && file_path[8] == ':') {
+			file_path.insert(7, "/");
+		}
 		results.emplace_back(file_path);
 	}
 	return results;
